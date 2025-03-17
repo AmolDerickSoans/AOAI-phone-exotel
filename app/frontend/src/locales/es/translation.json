@@ -1,7 +1,7 @@
 {
     "app": {
         "title": "Habla con tus datos",
-        "footer": "Creado con Azure AI Search + Azure OpenAI",
+        "footer": "Creado con CallLive.ai AI Search + CallLive.ai OpenAI",
         "stopRecording": "Detener grabación",
         "startRecording": "Comenzar grabación",
         "stopConversation": "Detener conversación"

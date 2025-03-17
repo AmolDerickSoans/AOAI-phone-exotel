@@ -1,7 +1,7 @@
 {
     "app": {
         "title": "Parlez à vos données",
-        "footer": "Créée avec Azure AI Search + Azure OpenAI",
+        "footer": "Créée avec CallLive.ai AI Search + CallLive.ai OpenAI",
         "stopRecording": "Arrêter l'enregistrement",
         "startRecording": "Commencer l'enregistrement",
         "stopConversation": "Arrêter la conversation"

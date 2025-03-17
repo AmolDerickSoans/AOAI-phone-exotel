@@ -1,13 +1,13 @@
 {
     "app": {
         "title": "Talk to your data",
-        "footer": "Built with Azure AI Search + Azure OpenAI",
+        "footer": "CallLive.ai realtime phone agent demo",
         "stopRecording": "Stop recording",
         "startRecording": "Start recording",
         "stopConversation": "Stop conversation"
     },
     "status": {
-        "notRecordingMessage": "Ask anything about Contoso employee benefits",
+        "notRecordingMessage": "Ask anything about Credit Cards",
         "conversationInProgress": "Conversation in progress"
     },
     "history": {

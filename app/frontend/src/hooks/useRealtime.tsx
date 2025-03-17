@@ -54,7 +54,7 @@ export default function useRealTime({
     const wsEndpoint = useDirectAoaiApi
         ? `${aoaiEndpointOverride}/openai/realtime?api-key=${aoaiApiKeyOverride}&deployment=${aoaiModelOverride}&api-version=2024-10-01-preview`
         : `/realtime`;
-
+    
     const { sendJsonMessage } = useWebSocket(wsEndpoint, {
         onOpen: () => onWebSocketOpen?.(),
         onClose: () => onWebSocketClose?.(),
@@ -64,6 +64,7 @@ export default function useRealTime({
     });
 
     const startSession = () => {
+        console.log("WebSocket endpoint:", wsEndpoint);
         const command: SessionUpdateCommand = {
             type: "session.update",
             session: {
