@@ -1,0 +1,13 @@
+websockets==13.1
+pydub
+numpy
+deepgram-sdk
+python-dotenv
+ audioop-lts; python_version>='3.13' 
+aiohttp==3.9.3
+azure-identity==1.18.0
+azure-search-documents==11.6.0b4
+python-dotenv==1.0.1
+azure-storage-blob==12.23.1
+gunicorn
+rich
