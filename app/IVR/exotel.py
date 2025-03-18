@@ -73,7 +73,7 @@ class AudioHandler:
 # Create a global audio handler
 # audio_handler = AudioHandler() # Moved inside main to use environment variable
 
-### Starting exotel Web Handler
+### Starting Exotel Web Handler
 async def exotel_handler(exotel_ws):
     stream_sid = None
     call_sid = None
@@ -230,15 +230,37 @@ async def client_handler(client_ws):
 
     try:
         # Get the call_sid from the client
-        call_sid = await client_ws.recv()
-        call_sid = call_sid.strip()
+        raw_call_sid = await client_ws.recv()
+        try:
+            # Try to parse as JSON first
+            data = json.loads(raw_call_sid)
+            # If it's a JSON object with call_sid field, use that
+            call_sid = data.get('call_sid', '')
+            # If it's just an event without call_sid, log and close
+            if not call_sid and data.get('event') == 'connected':
+                logger.warning("Received 'connected' event without call_sid")
+                await client_ws.send(json.dumps({"error": "No call_sid provided"}))
+                await client_ws.close()
+                return
+        except json.JSONDecodeError:
+            # If not JSON, use as plain string
+            call_sid = raw_call_sid.strip()
+
+        if not call_sid:
+            logger.warning("Empty call_sid received")
+            await client_ws.send(json.dumps({"error": "Empty call_sid"}))
+            await client_ws.close()
+            return
+
         logger.info(f"Client requested to subscribe to call_sid: {call_sid}")
 
         if call_sid in subscribers:
             subscribers[call_sid].append(client_queue)
             logger.info(f"Client subscribed to call_sid: {call_sid}")
         else:
-            logger.warning(f"Client tried to subscribe to non-existent call_sid: {call_sid}")
+            error_msg = f"Client tried to subscribe to non-existent call_sid: {call_sid}"
+            logger.warning(error_msg)
+            await client_ws.send(json.dumps({"error": error_msg}))
             await client_ws.close()
             return
 
