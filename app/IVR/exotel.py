@@ -286,6 +286,8 @@ def main():
     # Configure SSL for production environment
     if os.environ.get("RENDER") or os.environ.get("PRODUCTION"):
         ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        # In production, we're behind a proxy that handles SSL
+        ssl_context = None
 
     if not all([endpoint, deployment]):
         logger.error("Required environment variables not set.")
@@ -299,9 +301,17 @@ def main():
     # Bind to all interfaces (0.0.0.0) instead of just localhost
     host = '0.0.0.0'
 
-    # Create the server with SSL if in production
-    server = websockets.serve(router, host, port, ssl=ssl_context)
-    logger.info(f'Server starting on ws://{host}:{port}')
+    # Create the server
+    server = websockets.serve(
+        router,
+        host,
+        port,
+        ssl=ssl_context,
+        compression=None,  # Disable compression to work better with proxies
+        max_size=10 * 1024 * 1024  # 10MB max message size
+    )
+    protocol = "wss" if ssl_context else "ws"
+    logger.info(f'Server starting on {protocol}://{host}:{port}')
 
     # Run the server
     asyncio.get_event_loop().run_until_complete(server)
