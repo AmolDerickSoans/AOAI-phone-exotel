@@ -244,6 +244,48 @@ async def exotel_handler(exotel_ws):
 
     await exotel_ws.close()
 
+async def client_handler(websocket):
+    """Handle WebSocket connections from clients who want to subscribe to call transcripts"""
+    try:
+        # Wait for the initial message that should contain the call_sid to subscribe to
+        message = await websocket.recv()
+        data = json.loads(message)
+        call_sid = data.get('call_sid')
+
+        if not call_sid:
+            logger.warning('Client did not provide call_sid')
+            await websocket.close(code=4002, reason='Missing call_sid')
+            return
+
+        # Create a queue for this client
+        client_queue = asyncio.Queue()
+
+        # Add the client's queue to the subscribers for this call
+        if call_sid not in subscribers:
+            subscribers[call_sid] = []
+        subscribers[call_sid].append(client_queue)
+
+        try:
+            # Keep sending messages to the client as they arrive
+            while True:
+                message = await client_queue.get()
+                if message == 'close':
+                    break
+                await websocket.send(message)
+        finally:
+            # Remove the client's queue from subscribers when they disconnect
+            if call_sid in subscribers and client_queue in subscribers[call_sid]:
+                subscribers[call_sid].remove(client_queue)
+                if not subscribers[call_sid]:
+                    del subscribers[call_sid]
+
+    except websockets.exceptions.ConnectionClosed:
+        logger.info('Client connection closed normally')
+    except Exception as e:
+        logger.error(f'Error in client handler: {str(e)}')
+    finally:
+        await websocket.close()
+
 async def router(websocket, path):
     try:
         logger.info(f'Incoming connection request for path: {path}')
