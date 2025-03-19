@@ -2,7 +2,9 @@ import asyncio
 import json
 import logging
 from typing import Dict, Optional
-
+import numpy as np
+from scipy import signal
+import base64
 import aiohttp
 from azure.core.credentials import AzureKeyCredential
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
@@ -34,6 +36,7 @@ class RTMTDirectHandler:
         self.sessions = {}     # Store aiohttp sessions by call_sid
         self.response_queues = {}  # Store response queues by call_sid
         self.processing_tasks = {}  # Store background tasks by call_sid
+        self.audio_buffers = {}
         
     async def create_rtmt_connection(self, call_sid: str):
         """Create a new RTMT connection for a specific call"""
@@ -53,7 +56,8 @@ class RTMTDirectHandler:
                 headers["Authorization"] = f"Bearer {token}"
                 
             # Connect to the WebSocket
-            ws_url = f"{self.endpoint}/openai/realtime"
+            endpoint = self.endpoint.rstrip('/')
+            ws_url = f"{endpoint}/openai/realtime"
             params = {"api-version": self.api_version, "deployment": self.deployment}
             logger.info(f"Connecting to WebSocket: {ws_url} with params: {params}")
             
@@ -68,16 +72,23 @@ class RTMTDirectHandler:
             # Initialize the session with proper configuration
             logger.info(f"Initializing RTMT session for call {call_sid}")
             init_message = {
-                "type": "session.update",
-                "session": {
-                    "instructions": "You are a helpful assistant.",
-                    "temperature": 0.7,
-                    "max_response_output_tokens": 500,
-                    # "disable_audio": False,
-                    "voice": self.voice_choice or "alloy"
+                    "type": "session.update",
+                    "session": {
+                        "instructions": "You are a helpful assistant.",
+                        "temperature": 0.7,
+                        "max_response_output_tokens": 500,
+                        "voice": self.voice_choice or "alloy",
+                        "input_audio_format": "g711_ulaw",
+                        "output_audio_format": "g711_ulaw",
+                        "turn_detection": {"type": "server_vad"},
+                        "modalities": ["text", "audio"]
+                    }
                 }
-            }
             await ws.send_json(init_message)
+
+                # Also send a single response.create at initialization time
+            await ws.send_json({"type": "response.create"})
+
             logger.info(f"Sent session initialization message for call {call_sid}")
             
             return ws
@@ -138,9 +149,8 @@ class RTMTDirectHandler:
             # Don't close the connection here, as that would cause problems
             # if the connection is still being used
             logger.info(f"Response processor ending for call {call_sid}")
-    
+
     async def process_audio(self, call_sid: str, audio_chunk: bytes) -> Optional[str]:
-        """Process audio chunk and return transcription if available"""
         try:
             if call_sid not in self.connections:
                 logger.warning(f"No connection found for call {call_sid}")
@@ -158,11 +168,14 @@ class RTMTDirectHandler:
                     logger.error(f"Failed to reconnect for call {call_sid}: {str(e)}")
                     return None
             
-            # Create a new response for each audio chunk
-            await ws.send_json({"type": "response.create"})
+            # Convert binary audio to base64 string
+            audio_base64 = base64.b64encode(audio_chunk).decode('ascii')
             
-            # Send the audio chunk
-            await ws.send_bytes(audio_chunk)
+            # Send audio in the JSON message as a base64 string
+            await ws.send_json({
+                "type": "input_audio_buffer.append",
+                "audio": audio_base64
+            })
             
             # Check if there's a response with a brief timeout
             try:
@@ -174,7 +187,15 @@ class RTMTDirectHandler:
         except Exception as e:
             logger.error(f"Error processing audio for call {call_sid}: {str(e)}", exc_info=True)
             return None
-    
+    def _mulaw_to_linear(self, mulaw_data):
+        """Convert mu-law audio to linear PCM"""
+        # Standard mu-law decoding
+        mu = 255
+        y = mulaw_data.astype(np.float32)
+        y = 2 * (y / mu) - 1
+        x = np.sign(y) * (1 / mu) * ((1 + mu)**abs(y) - 1)
+        return (x * 32767).astype(np.int16)  # Convert to 16-bit PCM
+
     async def close_connection(self, call_sid: str):
         """Close an RTMT connection for a specific call"""
         logger.info(f"Closing connection for call {call_sid}")
@@ -212,5 +233,8 @@ class RTMTDirectHandler:
         # Clean up the response queue
         if call_sid in self.response_queues:
             del self.response_queues[call_sid]
+        
+        if call_sid in self.audio_buffers:
+            del self.audio_buffers[call_sid]
             
-        logger.info(f"Closed RTMT connection for call {call_sid}")
+        logger.info(f"Closed RTMT connection for call {call_sid}")       
