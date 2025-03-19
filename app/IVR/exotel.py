@@ -284,8 +284,6 @@ async def client_handler(websocket):
                 await websocket.send(json.dumps({"status": "error", "message": "Invalid call_sid"}))
                 return
 
-            logger.info(f"Client requested to subscribe to call_sid: {call_sid}")
-
             # Initialize the subscribers list for this call_sid if it doesn't exist
             if call_sid not in subscribers:
                 subscribers[call_sid] = []
