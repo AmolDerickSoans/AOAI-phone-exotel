@@ -73,7 +73,7 @@ class RTMTDirectHandler:
                     "instructions": "You are a helpful assistant.",
                     "temperature": 0.7,
                     "max_response_output_tokens": 500,
-                    "disable_audio": False,
+                    # "disable_audio": False,
                     "voice": self.voice_choice or "alloy"
                 }
             }

@@ -59,7 +59,7 @@ class RTMiddleTier:
     system_message: Optional[str] = None
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
-    disable_audio: Optional[bool] = None
+    #disable_audio: Optional[bool] = None
     voice_choice: Optional[str] = None
     api_version: str = "2024-10-01-preview"
     _tools_pending = {}
@@ -168,12 +168,13 @@ class RTMiddleTier:
                         session["temperature"] = self.temperature
                     if self.max_tokens is not None:
                         session["max_response_output_tokens"] = self.max_tokens
-                    if self.disable_audio is not None:
-                        session["disable_audio"] = self.disable_audio
+                    # Remove this line:
+                    # if self.disable_audio is not None:
+                    #     session["disable_audio"] = self.disable_audio
                     if self.voice_choice is not None:
                         session["voice"] = self.voice_choice
                     session["tool_choice"] = "auto" if len(self.tools) > 0 else "none"
-                    session["tools"] = [tool.schema for tool in self.tools.values()]
+                  session["tools"] = [tool.schema for tool in self.tools.values()]
                     updated_message = json.dumps(message)
 
         return updated_message
