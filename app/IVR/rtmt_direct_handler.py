@@ -1,9 +1,9 @@
 import asyncio
 import json
 import logging
-import aiohttp
 from typing import Dict, Optional
 
+import aiohttp
 from azure.core.credentials import AzureKeyCredential
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 
@@ -11,138 +11,206 @@ logger = logging.getLogger('rtmt_direct')
 
 class RTMTDirectHandler:
     def __init__(self, endpoint: str, deployment: str, credentials: AzureKeyCredential | DefaultAzureCredential, voice_choice: Optional[str] = None):
+        # Log configuration
+        logger.info(f"Initializing RTMT Direct Handler with endpoint: {endpoint}, deployment: {deployment}")
+        
         self.endpoint = endpoint
         self.deployment = deployment
         self.voice_choice = voice_choice
-        self.api_version = "2024-10-01-preview"
+        self.api_version = "2024-10-01-preview"  # Using a stable API version
         
         # Handle credentials
         if isinstance(credentials, AzureKeyCredential):
             self.key = credentials.key
             self._token_provider = None
+            logger.info("Using Azure Key Credential for authentication")
         else:
             self.key = None
             self._token_provider = get_bearer_token_provider(credentials, "https://cognitiveservices.azure.com/.default")
-            self._token_provider()  # Warm up during startup
+            logger.info("Using Azure Identity Credential for authentication")
             
-        # Store active connections
-        self.connections = {}
-        self.sessions = {}
-        self.transcripts = {}
+        # Track connections and sessions
+        self.connections = {}  # Store WebSocket connections by call_sid
+        self.sessions = {}     # Store aiohttp sessions by call_sid
+        self.response_queues = {}  # Store response queues by call_sid
+        self.processing_tasks = {}  # Store background tasks by call_sid
         
     async def create_rtmt_connection(self, call_sid: str):
         """Create a new RTMT connection for a specific call"""
         try:
-            # Create a new session for this call
+            # Create a session for this call
+            logger.info(f"Creating aiohttp session for call {call_sid}")
             session = aiohttp.ClientSession()
             self.sessions[call_sid] = session
+            self.response_queues[call_sid] = asyncio.Queue()
             
             # Prepare headers
             headers = {}
             if self.key:
                 headers["api-key"] = self.key
             else:
-                headers["Authorization"] = f"Bearer {self._token_provider()}"
+                token = self._token_provider()
+                headers["Authorization"] = f"Bearer {token}"
                 
-            # Connect to RTMT service
+            # Connect to the WebSocket
+            ws_url = f"{self.endpoint}/openai/realtime"
             params = {"api-version": self.api_version, "deployment": self.deployment}
-            ws = await session.ws_connect(
-                f"{self.endpoint}/openai/realtime",
-                headers=headers,
-                params=params
-            )
+            logger.info(f"Connecting to WebSocket: {ws_url} with params: {params}")
             
-            # Store the connection and initialize transcript buffer
+            ws = await session.ws_connect(ws_url, params=params, headers=headers)
             self.connections[call_sid] = ws
-            self.transcripts[call_sid] = ""
+            logger.info(f"WebSocket connection established for call {call_sid}")
             
-            # Send session.create message with appropriate configurations
-            await ws.send_json({
-                "type": "session.create",
+            # Create and store the response processing task
+            process_task = asyncio.create_task(self._process_responses(call_sid))
+            self.processing_tasks[call_sid] = process_task
+            
+            # Initialize the session with proper configuration
+            logger.info(f"Initializing RTMT session for call {call_sid}")
+            init_message = {
+                "type": "session.update",
                 "session": {
-                    "instructions": "You're a voice assistant. Keep responses very brief, one or two sentences max.",
+                    "instructions": "You are a helpful assistant.",
                     "temperature": 0.7,
+                    "max_response_output_tokens": 500,
                     "disable_audio": False,
                     "voice": self.voice_choice or "alloy"
                 }
-            })
+            }
+            await ws.send_json(init_message)
+            logger.info(f"Sent session initialization message for call {call_sid}")
             
-            logger.info(f"Successfully created RTMT connection for call {call_sid}")
             return ws
             
         except Exception as e:
-            logger.error(f"Error creating RTMT connection: {str(e)}")
+            logger.error(f"Error creating RTMT connection: {str(e)}", exc_info=True)
+            # Clean up any resources
             await self.close_connection(call_sid)
             raise
     
+    async def _process_responses(self, call_sid: str):
+        """Process WebSocket responses in background"""
+        try:
+            if call_sid not in self.connections:
+                logger.error(f"No connection found for call {call_sid} in _process_responses")
+                return
+                
+            ws = self.connections[call_sid]
+            logger.info(f"Started response processor for call {call_sid}")
+            
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    logger.debug(f"Received message type: {data.get('type')}")
+                    
+                    # Log any errors from the service
+                    if data.get("type") == "error":
+                        logger.error(f"Error from RTMT service: {data}")
+                        continue
+                        
+                    # Handle session creation confirmation
+                    if data.get("type") == "session.created":
+                        logger.info(f"Session successfully created for call {call_sid}")
+                        continue
+                    
+                    # Extract text from response items
+                    if data.get("type") == "response.output_item.added":
+                        item = data.get("item", {})
+                        if item.get("type") == "text":
+                            content = item.get("content")
+                            if content:
+                                logger.info(f"Received text response: {content[:50]}...")
+                                await self.response_queues[call_sid].put(content)
+                
+                elif msg.type == aiohttp.WSMsgType.CLOSED:
+                    logger.warning(f"WebSocket closed for call {call_sid}")
+                    break
+                    
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    logger.error(f"WebSocket error for call {call_sid}: {ws.exception()}")
+                    break
+                    
+        except asyncio.CancelledError:
+            logger.info(f"Response processor task cancelled for call {call_sid}")
+        except Exception as e:
+            logger.error(f"Error in response processor for call {call_sid}: {str(e)}", exc_info=True)
+        finally:
+            # Don't close the connection here, as that would cause problems
+            # if the connection is still being used
+            logger.info(f"Response processor ending for call {call_sid}")
+    
     async def process_audio(self, call_sid: str, audio_chunk: bytes) -> Optional[str]:
         """Process audio chunk and return transcription if available"""
-        if call_sid not in self.connections:
-            logger.warning(f"No connection found for call {call_sid}")
-            return None
-            
-        ws = self.connections[call_sid]
-        transcript = None
-        
         try:
+            if call_sid not in self.connections:
+                logger.warning(f"No connection found for call {call_sid}")
+                return None
+                
+            ws = self.connections[call_sid]
+            
+            if ws.closed:
+                logger.warning(f"Connection closed for call {call_sid}, attempting to reconnect")
+                try:
+                    await self.close_connection(call_sid)
+                    await self.create_rtmt_connection(call_sid)
+                    ws = self.connections[call_sid]
+                except Exception as e:
+                    logger.error(f"Failed to reconnect for call {call_sid}: {str(e)}")
+                    return None
+            
+            # Create a new response for each audio chunk
+            await ws.send_json({"type": "response.create"})
+            
             # Send the audio chunk
             await ws.send_bytes(audio_chunk)
             
-            # Process any available messages (non-blocking)
-            async def process_messages():
-                nonlocal transcript
-                # Use a timeout to make this non-blocking
-                try:
-                    msg = await asyncio.wait_for(ws.receive(), timeout=0.1)
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        data = json.loads(msg.data)
-                        
-                        # Handle different message types
-                        if data.get("type") == "response.output_item.added":
-                            item = data.get("item", {})
-                            if item.get("type") == "text":
-                                content = item.get("content", "")
-                                if content:
-                                    # Store and return only complete sentences
-                                    self.transcripts[call_sid] += content
-                                    transcript = self.transcripts[call_sid]
-                                    logger.debug(f"Transcript for {call_sid}: {transcript}")
-                                    
-                        elif data.get("type") == "session.created":
-                            logger.info(f"Session created for call {call_sid}")
-                            
-                        elif data.get("type") == "response.done":
-                            # Reset transcript for next utterance
-                            transcript = self.transcripts[call_sid]
-                            self.transcripts[call_sid] = ""
-                            
-                except asyncio.TimeoutError:
-                    pass  # No message available, that's fine
-                except Exception as e:
-                    logger.error(f"Error processing message: {str(e)}")
-                    
-            await process_messages()
-            return transcript
+            # Check if there's a response with a brief timeout
+            try:
+                return await asyncio.wait_for(self.response_queues[call_sid].get(), 0.5)
+            except asyncio.TimeoutError:
+                # No response available yet, that's normal
+                return None
             
         except Exception as e:
-            logger.error(f"Error processing audio for call {call_sid}: {str(e)}")
+            logger.error(f"Error processing audio for call {call_sid}: {str(e)}", exc_info=True)
             return None
     
     async def close_connection(self, call_sid: str):
         """Close an RTMT connection for a specific call"""
-        try:
-            if call_sid in self.connections:
-                await self.connections[call_sid].close()
+        logger.info(f"Closing connection for call {call_sid}")
+        
+        # Cancel the processing task if it exists
+        if call_sid in self.processing_tasks:
+            try:
+                self.processing_tasks[call_sid].cancel()
+                await asyncio.sleep(0.1)  # Give it a moment to clean up
+            except Exception as e:
+                logger.error(f"Error cancelling processing task: {str(e)}")
+            finally:
+                del self.processing_tasks[call_sid]
+        
+        # Close the WebSocket if it exists
+        if call_sid in self.connections:
+            try:
+                ws = self.connections[call_sid]
+                if not ws.closed:
+                    await ws.close()
+            except Exception as e:
+                logger.error(f"Error closing WebSocket: {str(e)}")
+            finally:
                 del self.connections[call_sid]
-                
-            if call_sid in self.sessions:
+        
+        # Close the session if it exists
+        if call_sid in self.sessions:
+            try:
                 await self.sessions[call_sid].close()
+            except Exception as e:
+                logger.error(f"Error closing session: {str(e)}")
+            finally:
                 del self.sessions[call_sid]
-                
-            if call_sid in self.transcripts:
-                del self.transcripts[call_sid]
-                
-            logger.info(f"Closed RTMT connection for call {call_sid}")
+        
+        # Clean up the response queue
+        if call_sid in self.response_queues:
+            del self.response_queues[call_sid]
             
-        except Exception as e:
-            logger.error(f"Error closing RTMT connection: {str(e)}")
+        logger.info(f"Closed RTMT connection for call {call_sid}")
