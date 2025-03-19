@@ -246,38 +246,100 @@ async def exotel_handler(exotel_ws):
 
 async def client_handler(websocket):
     """Handle WebSocket connections from clients who want to subscribe to call transcripts"""
+    client_queue = asyncio.Queue()
+
+    # First tell the client all active calls
+    await websocket.send(json.dumps(list(subscribers.keys())))
+    logger.info(f"Sent active calls to client: {list(subscribers.keys())}")
+
     try:
-        # Wait for the initial message that should contain the call_sid to subscribe to
+        # Get the message from the client
         message = await websocket.recv()
-        data = json.loads(message)
-        call_sid = data.get('call_sid')
-
-        if not call_sid:
-            logger.warning('Client did not provide call_sid')
-            await websocket.close(code=4002, reason='Missing call_sid')
-            return
-
-        # Create a queue for this client
-        client_queue = asyncio.Queue()
-
-        # Add the client's queue to the subscribers for this call
-        if call_sid not in subscribers:
-            subscribers[call_sid] = []
-        subscribers[call_sid].append(client_queue)
-
         try:
-            # Keep sending messages to the client as they arrive
-            while True:
-                message = await client_queue.get()
-                if message == 'close':
-                    break
-                await websocket.send(message)
-        finally:
-            # Remove the client's queue from subscribers when they disconnect
-            if call_sid in subscribers and client_queue in subscribers[call_sid]:
-                subscribers[call_sid].remove(client_queue)
-                if not subscribers[call_sid]:
-                    del subscribers[call_sid]
+            data = json.loads(message)
+            # Handle different message types
+            if data.get('event') == 'connected':
+                logger.info("Client sent connected event")
+                # Keep connection open and wait for future messages
+                message = await websocket.recv()
+                data = json.loads(message)
+
+            # Extract call_sid from start event or raw data
+            call_sid = None
+            if isinstance(data, dict):
+                if data.get('event') == 'start' and 'start' in data:
+                    call_sid = data['start'].get('call_sid')
+                    logger.info(f"Extracted call_sid from start event: {call_sid}")
+                elif 'call_sid' in data:
+                    call_sid = data['call_sid']
+                    logger.info(f"Extracted call_sid from data: {call_sid}")
+            else:
+                # If not a dict, treat as raw call_sid
+                call_sid = data if isinstance(data, str) else message.strip()
+            
+            logger.info(f"Client requested to subscribe to call_sid: {call_sid}")
+
+            if not call_sid:
+                logger.error("No valid call_sid found in client message")
+                await websocket.send(json.dumps({"status": "error", "message": "Invalid call_sid"}))
+                return
+
+            logger.info(f"Client requested to subscribe to call_sid: {call_sid}")
+
+            # Initialize the subscribers list for this call_sid if it doesn't exist
+            if call_sid not in subscribers:
+                subscribers[call_sid] = []
+                logger.info(f"Created new subscribers list for call_sid: {call_sid}")
+
+            # Add the client queue to subscribers
+            subscribers[call_sid].append(client_queue)
+            logger.info(f"Client subscribed to call_sid: {call_sid}")
+            
+            # Send confirmation to client
+            await websocket.send(json.dumps({"status": "success", "message": "Successfully subscribed to call"}))
+
+            # Initialize subscription success flag
+            subscription_success = True
+            
+            if not subscription_success:
+                try:
+                    await websocket.send(json.dumps({"status": "error", "message": "Call initialization timeout"}))
+                    logger.warning(f"Timeout waiting for call_sid: {call_sid} to be available")
+                    await websocket.close()
+                except websockets.exceptions.ConnectionClosed:
+                    logger.warning(f"Client connection closed after timeout for call {call_sid}")
+                return
+
+            async def client_sender(websocket):
+                try:
+                    while True:
+                        message = await client_queue.get()
+                        if message == 'close':
+                            logger.info("Received close message for client")
+                            break
+
+                        await websocket.send(message)
+                except Exception as e:
+                    logger.error(f"Error sending to client: {str(e)}")
+                finally:
+                    # Remove this client queue from subscribers
+                    if call_sid in subscribers and client_queue in subscribers[call_sid]:
+                        subscribers[call_sid].remove(client_queue)
+                        logger.info(f"Removed client from subscribers for call_sid: {call_sid}")
+
+            await client_sender(websocket)
+        except json.JSONDecodeError:
+            # If not valid JSON, treat as raw call_sid
+            call_sid = message.strip()
+            logger.info(f"Treating message as raw call_sid: {call_sid}")
+            # Continue with existing call_sid handling logic
+            if call_sid in subscribers:
+                subscribers[call_sid].append(client_queue)
+                logger.info(f"Client subscribed to call_sid: {call_sid}")
+            else:
+                logger.warning(f"Client tried to subscribe to non-existent call_sid: {call_sid}")
+                await websocket.close()
+                return
 
     except websockets.exceptions.ConnectionClosed:
         logger.info('Client connection closed normally')
