@@ -12,6 +12,8 @@ import aiohttp
 from aiohttp import web
 from azure.core.credentials import AzureKeyCredential
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+import numpy as np  # Import numpy
+from scipy import signal  # Import scipy.signal
 # Assuming rtmt.py is in a sibling directory named 'backend'
 from ..backend.rtmt import RTMiddleTier, Tool, ToolResult, ToolResultDirection
 
@@ -35,6 +37,9 @@ SYSTEM_MESSAGE = (
     "Your knowledge cutoff is 2023-10. You are a helpful, witty, and friendly AI. "
     "Act like a human, but remember that you aren't a human..."
 )
+# --- Audio Processing Constants ---
+EXOTEL_SAMPLE_RATE = 8000
+OPENAI_SAMPLE_RATE = 24000
 
 # --- FastAPI Setup ---
 app = FastAPI()
@@ -103,6 +108,13 @@ knowledge_base_tool = Tool(target=search_knowledge_base, schema=knowledge_base_t
 rt_middle_tier.tools["search_knowledge_base"] = knowledge_base_tool
 rt_middle_tier.system_message = SYSTEM_MESSAGE
 
+# --- Downsampling Function ---
+def downsample_audio(audio_data, from_rate=OPENAI_SAMPLE_RATE, to_rate=EXOTEL_SAMPLE_RATE):
+    """Downsamples audio data from OpenAI's sample rate to Exotel's sample rate."""
+    number_of_samples = round(len(audio_data) * to_rate / from_rate)
+    resampled = signal.resample(audio_data, number_of_samples)
+    return resampled.astype(np.int16)
+
 # --- WebSocket Handling ---
 @app.websocket("/handle-call")
 async def handle_media_stream(websocket: WebSocket):
@@ -129,7 +141,7 @@ async def handle_media_stream(websocket: WebSocket):
                         while True:
                             message = await websocket.receive_text()
                             data = json.loads(message)
-                            print(f"Received from Exotel: {data['event']}")
+                           
                             if data['event'] == 'media':
                                 if rtmt_ws.closed: return
                                 audio_payload = data['media']['payload']
@@ -142,9 +154,9 @@ async def handle_media_stream(websocket: WebSocket):
                                 stream_sid = data['stream_sid']
                                 print(f"Incoming stream started: {stream_sid}")
                             elif data['event'] == 'connected':
-                                print("Exotel connected")  # Log, but no action needed
+                                print("Exotel connected")
                             elif data['event'] == 'dtmf':
-                                print(f"DTMF: {data['dtmf']['digit']}") #Log
+                                print(f"DTMF: {data['dtmf']['digit']}")
                             elif data['event'] == 'stop':
                                 print(f"Stream stopped: {data['stop']['reason']}")
                                 if not rtmt_ws.closed: await rtmt_ws.close()
@@ -159,12 +171,18 @@ async def handle_media_stream(websocket: WebSocket):
                         if not rtmt_ws.closed: await rtmt_ws.close()
 
                 async def send_to_exotel():
-                    nonlocal session_initialized  # Correctly reference nonlocal variable
+                    nonlocal session_initialized
                     try:
                         async for msg in rtmt_ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
-                                response = json.loads(msg.data)
-                                print(f"Received from RTMiddleTier: {response}")
+                                # --- Robust JSON Parsing ---
+                                try:
+                                    response = json.loads(msg.data)
+                                except json.JSONDecodeError as e:
+                                    print(f"JSONDecodeError: {e} - Data: {msg.data}")
+                                    continue  # Skip to the next message
+
+                                # print(f"Received from RTMiddleTier: {response}")
 
                                 if response.get("type") == "session.created" and not session_initialized:
                                     await rtmt_ws.send_str(json.dumps({
@@ -195,15 +213,26 @@ async def handle_media_stream(websocket: WebSocket):
                                             "type": "response.create"
                                         }))
 
-                                elif response.get("type") == "response.audio.delta":
-                                    audio_payload = response.get("data")
+                                elif response.get("type") == "response.audio.delta" and response.get("delta"):
+                                    # Audio data delta - truncate to 30 chars for logging
+                                    truncated_response = response.copy()
+                                    truncated_response["delta"] = response["delta"][:30] + "..."
+                                    print(f"Received from RTMiddleTier: {truncated_response}")
+                                    # Keep message as is
+                                    pass  # Keep message as is
+                                    audio_payload = response.get("delta")
                                     if audio_payload:
+                                        # --- DOWNSAMPLING (Corrected) ---
                                         audio_bytes = base64.b64decode(audio_payload)
-                                        # Send audio to Exotel (already chunked correctly)
+                                        audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
+                                        downsampled_audio = downsample_audio(audio_array)
+                                        downsampled_bytes = downsampled_audio.tobytes()
+
+                                        # Send audio to Exotel
                                         await websocket.send_text(json.dumps({
                                             "event": "media",
-                                            "stream_sid": stream_sid,  # Use the stored stream_sid
-                                            "media": {"payload": base64.b64encode(audio_bytes).decode("ascii")}
+                                            "stream_sid": stream_sid,
+                                            "media": {"payload": base64.b64encode(downsampled_bytes).decode("ascii")}
                                         }))
 
                             elif msg.type == aiohttp.WSMsgType.ERROR:
