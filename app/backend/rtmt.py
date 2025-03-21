@@ -1,4 +1,3 @@
-
 import asyncio
 import json
 import logging
@@ -11,6 +10,9 @@ from azure.core.credentials import AzureKeyCredential
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 
 logger = logging.getLogger("voicerag")
+
+# --- ADDED: Debounce Delay ---
+RESPONSE_CREATE_DELAY = 0.5  # Seconds.  Adjust as needed.
 
 class ToolResultDirection(Enum):
     TO_SERVER = 1
@@ -84,6 +86,7 @@ class RTMiddleTier:
             except Exception as e:
                 logger.error(f"Initial token fetch failed: {e}")
                 raise  # Re-raise to prevent startup if token fetch fails
+
     async def _process_message_to_client(self, msg: str, client_ws: web.WebSocketResponse, server_ws: web.WebSocketResponse) -> Optional[str]:
         message = json.loads(msg.data)
         updated_message = msg.data
@@ -103,10 +106,10 @@ class RTMiddleTier:
                 case "response.output_item.added":
                     if "item" in message and message["item"]["type"] == "function_call":
                         updated_message = None
-                    elif "item" in message and message["item"]["type"] == "message": # ADD THIS
-                        if "content" in message["item"]: # ADD THIS
-                            for content_item in message["item"]["content"]: # ADD THIS
-                                if content_item["type"] == "audio": # ADD THIS
+                    elif "item" in message and message["item"]["type"] == "message":
+                        if "content" in message["item"]:
+                            for content_item in message["item"]["content"]:
+                                if content_item["type"] == "audio":
                                     # Audio is not function call, so we pass it through.
                                     pass  # Keep message as is.
 
@@ -153,10 +156,14 @@ class RTMiddleTier:
 
                 case "response.done":
                     if len(self._tools_pending) > 0:
-                        self._tools_pending.clear() # Any chance tool calls could be interleaved across different outstanding responses?
-                        await server_ws.send_json({
-                            "type": "response.create"
-                        })
+                        self._tools_pending.clear()
+
+                    # --- ADDED DELAY ---
+                    await asyncio.sleep(RESPONSE_CREATE_DELAY)
+
+                    await server_ws.send_json({
+                        "type": "response.create"
+                    })
                     if "response" in message:
                         replace = False
                         for i, output in enumerate(reversed(message["response"]["output"])):
@@ -164,20 +171,21 @@ class RTMiddleTier:
                                 message["response"]["output"].pop(i)
                                 replace = True
                         if replace:
-                            updated_message = json.dumps(message)                        
-                case "response.content_part.added": # ADD THIS
-                    if "part" in message and message["part"]["type"] == "audio": # ADD THIS
+                            updated_message = json.dumps(message)
+                case "response.content_part.added":
+                    if "part" in message and message["part"]["type"] == "audio":
                         # Audio content part added, keep it
-                        pass # Keep message as is
+                        pass  # Keep message as is
 
-                case "response.audio_transcript.delta": # ADD THIS
+                case "response.audio_transcript.delta":
                     # Audio transcript delta,keep it
-                    pass # Keep message as is
-                case "response.audio.delta": # VERY IMPORTANT - Add handling for audio data
+                    pass  # Keep message as is
+                case "response.audio.delta":
                     # Audio data delta - keep the message
                     pass  # Keep message as is
 
         return updated_message
+
     async def _process_message_to_server(self, msg: str, ws: web.WebSocketResponse) -> Optional[str]:
         message = json.loads(msg.data)
         updated_message = msg.data
