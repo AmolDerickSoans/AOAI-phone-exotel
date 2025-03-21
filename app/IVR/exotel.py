@@ -182,8 +182,8 @@ async def handle_media_stream(websocket: WebSocket):
                                     print(f"JSONDecodeError: {e} - Data: {msg.data}")
                                     continue  # Skip to the next message
 
-                                # print(f"Received from RTMiddleTier: {response}")
-
+                                truncated_response = str(response)[:600] + "..." if len(str(response)) > 100 else str(response)
+                                print(f"Received from RTMiddleTier: {truncated_response}")
                                 if response.get("type") == "session.created" and not session_initialized:
                                     await rtmt_ws.send_str(json.dumps({
                                         "type": "session.update",
@@ -217,7 +217,7 @@ async def handle_media_stream(websocket: WebSocket):
                                     # Audio data delta - truncate to 30 chars for logging
                                     truncated_response = response.copy()
                                     truncated_response["delta"] = response["delta"][:30] + "..."
-                                    print(f"Received from RTMiddleTier: {truncated_response}")
+                                    print(f"Received from RTMiddleTier: {response['delta'][:30]}...")
                                     # Keep message as is
                                     pass  # Keep message as is
                                     audio_payload = response.get("delta")
