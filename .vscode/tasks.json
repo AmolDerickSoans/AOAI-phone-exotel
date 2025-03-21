@@ -12,6 +12,15 @@
                 "cwd": "${workspaceFolder}/app"
             },
             "problemMatcher": []
+        },
+        {
+            "label": "activate-venv",
+            "type": "shell",
+            "command": "source ${workspaceFolder}/venv/bin/activate",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
         }
     ]
 }

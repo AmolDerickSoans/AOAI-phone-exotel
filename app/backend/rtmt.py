@@ -1,3 +1,4 @@
+
 import asyncio
 import json
 import logging
@@ -73,10 +74,16 @@ class RTMiddleTier:
             logger.info("Realtime voice choice set to %s", voice_choice)
         if isinstance(credentials, AzureKeyCredential):
             self.key = credentials.key
+            logger.info("Using AzureKeyCredential")
         else:
             self._token_provider = get_bearer_token_provider(credentials, "https://cognitiveservices.azure.com/.default")
-            self._token_provider() # Warm up during startup so we have a token cached when the first request arrives
-
+            logger.info("Using DefaultAzureCredential.  Attempting initial token fetch...")
+            try:
+                token = self._token_provider() # Warm up during startup so we have a token cached when the first request arrives
+                logger.info(f"Initial token fetch successful: {token[:20]}...")  # Log first 20 chars of token
+            except Exception as e:
+                logger.error(f"Initial token fetch failed: {e}")
+                raise  # Re-raise to prevent startup if token fetch fails
     async def _process_message_to_client(self, msg: str, client_ws: web.WebSocketResponse, server_ws: web.WebSocketResponse) -> Optional[str]:
         message = json.loads(msg.data)
         updated_message = msg.data
@@ -96,6 +103,12 @@ class RTMiddleTier:
                 case "response.output_item.added":
                     if "item" in message and message["item"]["type"] == "function_call":
                         updated_message = None
+                    elif "item" in message and message["item"]["type"] == "message": # ADD THIS
+                        if "content" in message["item"]: # ADD THIS
+                            for content_item in message["item"]["content"]: # ADD THIS
+                                if content_item["type"] == "audio": # ADD THIS
+                                    # Audio is not function call, so we pass it through.
+                                    pass  # Keep message as is.
 
                 case "conversation.item.created":
                     if "item" in message and message["item"]["type"] == "function_call":
@@ -152,9 +165,19 @@ class RTMiddleTier:
                                 replace = True
                         if replace:
                             updated_message = json.dumps(message)                        
+                case "response.content_part.added": # ADD THIS
+                    if "part" in message and message["part"]["type"] == "audio": # ADD THIS
+                        # Audio content part added, keep it
+                        pass # Keep message as is
+
+                case "response.audio_transcript.delta": # ADD THIS
+                    # Audio transcript delta,keep it
+                    pass # Keep message as is
+                case "response.audio.delta": # VERY IMPORTANT - Add handling for audio data
+                    # Audio data delta - keep the message
+                    pass  # Keep message as is
 
         return updated_message
-
     async def _process_message_to_server(self, msg: str, ws: web.WebSocketResponse) -> Optional[str]:
         message = json.loads(msg.data)
         updated_message = msg.data
@@ -174,7 +197,7 @@ class RTMiddleTier:
                     if self.voice_choice is not None:
                         session["voice"] = self.voice_choice
                     session["tool_choice"] = "auto" if len(self.tools) > 0 else "none"
-                  session["tools"] = [tool.schema for tool in self.tools.values()]
+                    session["tools"] = [tool.schema for tool in self.tools.values()]
                     updated_message = json.dumps(message)
 
         return updated_message
@@ -182,44 +205,75 @@ class RTMiddleTier:
     async def _forward_messages(self, ws: web.WebSocketResponse):
         async with aiohttp.ClientSession(base_url=self.endpoint) as session:
             params = { "api-version": self.api_version, "deployment": self.deployment}
+            logger.info(f"Connecting to Azure OpenAI with params: {params}")
             headers = {}
             if "x-ms-client-request-id" in ws.headers:
                 headers["x-ms-client-request-id"] = ws.headers["x-ms-client-request-id"]
             if self.key is not None:
                 headers = { "api-key": self.key }
+                logger.info("Using API Key for authentication.")
             else:
-                headers = { "Authorization": f"Bearer {self._token_provider()}" } # NOTE: no async version of token provider, maybe refresh token on a timer?
-            async with session.ws_connect("/openai/realtime", headers=headers, params=params) as target_ws:
-                async def from_client_to_server():
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            new_msg = await self._process_message_to_server(msg, ws)
-                            if new_msg is not None:
-                                await target_ws.send_str(new_msg)
-                        else:
-                            print("Error: unexpected message type:", msg.type)
-                    
-                    # Means it is gracefully closed by the client then time to close the target_ws
-                    if target_ws:
-                        print("Closing OpenAI's realtime socket connection.")
-                        await target_ws.close()
-                        
-                async def from_server_to_client():
-                    async for msg in target_ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            new_msg = await self._process_message_to_client(msg, ws, target_ws)
-                            if new_msg is not None:
-                                await ws.send_str(new_msg)
-                        else:
-                            print("Error: unexpected message type:", msg.type)
-
+                logger.info("Using AAD token for authentication. Fetching token...")
                 try:
-                    await asyncio.gather(from_client_to_server(), from_server_to_client())
-                except ConnectionResetError:
-                    # Ignore the errors resulting from the client disconnecting the socket
-                    pass
+                    token = self._token_provider()
+                    logger.info(f"Token fetched successfully: {token[:20]}...") # Log first 20 chars
+                    headers["Authorization"] = f"Bearer {token}"
+                except Exception as e:
+                    logger.error(f"Failed to fetch AAD token: {e}")
+                    await ws.send_str(f"Error: Failed to authenticate with Azure OpenAI: {e}")  # Inform the client
+                    return  # Exit if we can't get a token
+
+            logger.info(f"Request Headers: {headers}")  # Log the headers
+
+            try:
+                async with session.ws_connect("/openai/realtime", headers=headers, params=params) as target_ws:
+                    logger.info("Connected to Azure OpenAI realtime endpoint.")
+
+                    async def from_client_to_server():
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                new_msg = await self._process_message_to_server(msg, ws)
+                                if new_msg is not None:
+                                    await target_ws.send_str(new_msg)
+                            else:
+                                print("Error: unexpected message type:", msg.type)
+                        
+                        # Means it is gracefully closed by the client then time to close the target_ws
+                        if target_ws:
+                            print("Closing OpenAI's realtime socket connection.")
+                            await target_ws.close()
+                            
+                    async def from_server_to_client():
+                        async for msg in target_ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                new_msg = await self._process_message_to_client(msg, ws, target_ws)
+                                if new_msg is not None:
+                                    await ws.send_str(new_msg)
+                            else:
+                                print("Error: unexpected message type:", msg.type)
+
+                    try:
+                        await asyncio.gather(from_client_to_server(), from_server_to_client())
+                    except ConnectionResetError:
+                        # Ignore the errors resulting from the client disconnecting the socket
+                        pass
+                    except aiohttp.ClientResponseError as e:
+                        logger.error(f"Azure OpenAI ClientResponseError: {e.status}, {e.message}, {e.headers}")
+                        await ws.send_str(f"Error from Azure OpenAI: {e.status} - {e.message}")
+                    except Exception as e:
+                        logger.exception(f"An unexpected error occurred: {e}")
+                        await ws.send_str(f"An unexpected error occurred: {type(e).__name__} - {e}")
+
+            except aiohttp.ClientConnectorError as e:
+                logger.error(f"Failed to connect to Azure OpenAI: {e}")
+                await ws.send_str(f"Error: Failed to connect to Azure OpenAI: {e}")
+            except Exception as e:
+                logger.exception(f"An unexpected error occurred during connection: {e}")
+                await ws.send_str(f"An unexpected error occurred: {type(e).__name__} - {e}")
+
 
     async def _websocket_handler(self, request: web.Request):
+        logger.info(f"Received websocket connection request: {request.headers}")  # Log incoming request headers
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         await self._forward_messages(ws)

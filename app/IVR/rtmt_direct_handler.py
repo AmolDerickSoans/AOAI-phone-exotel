@@ -20,6 +20,7 @@ class RTMTDirectHandler:
         self.deployment = deployment
         self.voice_choice = voice_choice
         self.api_version = "2024-10-01-preview"  # Using a stable API version
+        self.sample_rate = 24000  # Default sample rate for Azure OpenAI
         
         # Handle credentials
         if isinstance(credentials, AzureKeyCredential):
@@ -37,6 +38,8 @@ class RTMTDirectHandler:
         self.response_queues = {}  # Store response queues by call_sid
         self.processing_tasks = {}  # Store background tasks by call_sid
         self.audio_buffers = {}
+        self.current_response_ids = {}  # Track current response IDs
+        self.speech_active = {}  # Track if speech is currently active
         
     async def create_rtmt_connection(self, call_sid: str):
         """Create a new RTMT connection for a specific call"""
@@ -72,20 +75,44 @@ class RTMTDirectHandler:
             # Initialize the session with proper configuration
             logger.info(f"Initializing RTMT session for call {call_sid}")
             init_message = {
-                    "type": "session.update",
-                    "session": {
-                        "instructions": "You are a helpful assistant.",
-                        "temperature": 0.7,
-                        "max_response_output_tokens": 500,
-                        "voice": self.voice_choice or "alloy",
-                        "input_audio_format": "g711_ulaw",
-                        "output_audio_format": "g711_ulaw",
-                        "turn_detection": {"type": "server_vad"},
-                        "modalities": ["text", "audio"]
-                    }
+                "type": "session.update",
+                "session": {
+                    "instructions": "You are a helpful assistant.",
+                    "temperature": 0.7,
+                    "max_response_output_tokens": 500,
+                    "voice": self.voice_choice or "alloy",
+                    "input_audio_format": "pcm16",  # Changed from g711_ulaw to pcm16
+                    "output_audio_format": "pcm16",  # Changed from g711_ulaw to pcm16
+                    "turn_detection": {"type": "server_vad"},
+                    "vad": {
+                        "speech_activity_threshold": 0.8,        # Higher threshold for more precision
+                        "speech_start_threshold_ms": 200,        # Wait 200ms before considering speech started
+                        "speech_end_threshold_ms": 1000,         # Wait 1000ms of silence before ending turn
+                        "speech_timeout_threshold_ms": 15000     # Max 15s for a single utterance
+                    },
+                    "sample_rate": self.sample_rate,
+                    "modalities": ["text", "audio"]
                 }
+            }
             await ws.send_json(init_message)
 
+                            # Send initial conversation setup
+            init_conversation = {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "This is a voice conversation."
+                            }
+                        ]
+                    }
+                }
+            await ws.send_json(init_conversation)
+            logger.info(f"Sent initial conversation setup for call {call_sid}")
+                
                 # Also send a single response.create at initialization time
             await ws.send_json({"type": "response.create"})
 
@@ -108,30 +135,66 @@ class RTMTDirectHandler:
                 
             ws = self.connections[call_sid]
             logger.info(f"Started response processor for call {call_sid}")
+            current_text_buffer = ""
             
             async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     data = json.loads(msg.data)
-                    logger.debug(f"Received message type: {data.get('type')}")
+                    msg_type = data.get("type", "unknown")
+                    logger.debug(f"Received message type: {msg_type}")
                     
                     # Log any errors from the service
-                    if data.get("type") == "error":
+                    if msg_type == "error":
                         logger.error(f"Error from RTMT service: {data}")
                         continue
                         
                     # Handle session creation confirmation
-                    if data.get("type") == "session.created":
+                    if msg_type == "session.created":
                         logger.info(f"Session successfully created for call {call_sid}")
                         continue
                     
                     # Extract text from response items
-                    if data.get("type") == "response.output_item.added":
+                    if msg_type == "response.output_item.added":
                         item = data.get("item", {})
                         if item.get("type") == "text":
-                            content = item.get("content")
+                            content = item.get("content", "")
                             if content:
-                                logger.info(f"Received text response: {content[:50]}...")
-                                await self.response_queues[call_sid].put(content)
+                                current_text_buffer += content
+                                logger.info(f"Added to text response: {content[:50]}...")
+                    
+                    # Text content completed, send it to subscribers
+                    if msg_type == "response.output_item.done":
+                        item = data.get("item", {})
+                        if item.get("type") == "text" and current_text_buffer:
+                            logger.info(f"Text response completed: {current_text_buffer[:50]}...")
+                            await self.response_queues[call_sid].put(current_text_buffer)
+                            current_text_buffer = ""  # Reset buffer
+                    
+                    # Handle audio.delta events for streaming audio responses
+                    if msg_type == "response.audio.delta" and data.get("delta"):
+                        # For now, we just log this - we're not sending audio back in this 
+                        # implementation as that's handled in the exotel.py layer
+                        logger.debug(f"Received audio delta for call {call_sid}")
+                        
+                    # Handle speech detection events
+                    if msg_type == "input_audio_buffer.speech_started":
+                        logger.info(f"Speech started detected for call {call_sid}")
+                        
+                    if msg_type == "input_audio_buffer.speech_stopped":
+                        logger.info(f"Speech stopped detected for call {call_sid}")
+                        
+                    # Handle rate limits
+                    if msg_type == "rate_limits.updated":
+                        limits = data.get("rate_limits", {})
+                        logger.debug(f"Rate limits updated for call {call_sid}: {limits}")
+                        
+                    # Response completed
+                    if msg_type == "response.done":
+                        logger.info(f"Response completed for call {call_sid}")
+                        # If there's any remaining text in the buffer, send it
+                        if current_text_buffer:
+                            await self.response_queues[call_sid].put(current_text_buffer)
+                            current_text_buffer = ""
                 
                 elif msg.type == aiohttp.WSMsgType.CLOSED:
                     logger.warning(f"WebSocket closed for call {call_sid}")
@@ -151,6 +214,11 @@ class RTMTDirectHandler:
             logger.info(f"Response processor ending for call {call_sid}")
 
     async def process_audio(self, call_sid: str, audio_chunk: bytes) -> Optional[str]:
+        """
+        Process audio chunk and return transcription if available.
+        
+        This method converts μ-law audio from Exotel to PCM16 format expected by Azure.
+        """
         try:
             if call_sid not in self.connections:
                 logger.warning(f"No connection found for call {call_sid}")
@@ -168,14 +236,39 @@ class RTMTDirectHandler:
                     logger.error(f"Failed to reconnect for call {call_sid}: {str(e)}")
                     return None
             
-            # Convert binary audio to base64 string
-            audio_base64 = base64.b64encode(audio_chunk).decode('ascii')
-            
-            # Send audio in the JSON message as a base64 string
-            await ws.send_json({
-                "type": "input_audio_buffer.append",
-                "audio": audio_base64
-            })
+            # Convert μ-law audio to PCM16
+            try:
+                # Assume audio_chunk is μ-law encoded from Exotel (8-bit μ-law, 8kHz)
+                mulaw_data = np.frombuffer(audio_chunk, dtype=np.uint8)
+                
+                # First convert to linear PCM (still at 8kHz)
+                pcm_data = self._mulaw_to_linear(mulaw_data)
+                
+                # Then upsample to the correct sample rate for Azure OpenAI (typically 24kHz)
+                upsampled_data = self._upsample_audio(pcm_data, 8000, self.sample_rate)
+                
+                # Convert to bytes
+                audio_bytes = upsampled_data.tobytes()
+                
+                # Convert to base64 for sending over WebSocket
+                audio_base64 = base64.b64encode(audio_bytes).decode('ascii')
+                
+                # Send the converted PCM16 audio
+                await ws.send_json({
+                    "type": "input_audio_buffer.append",
+                    "audio": audio_base64
+                })
+                
+                logger.debug(f"Sent {len(audio_bytes)} bytes of PCM16 audio for call {call_sid}")
+            except Exception as e:
+                logger.error(f"Error converting audio: {str(e)}")
+                # Fallback: send original audio
+                audio_base64 = base64.b64encode(audio_chunk).decode('ascii')
+                await ws.send_json({
+                    "type": "input_audio_buffer.append", 
+                    "audio": audio_base64
+                })
+                logger.warning(f"Used fallback method to send original audio for call {call_sid}")
             
             # Check if there's a response with a brief timeout
             try:
@@ -187,6 +280,13 @@ class RTMTDirectHandler:
         except Exception as e:
             logger.error(f"Error processing audio for call {call_sid}: {str(e)}", exc_info=True)
             return None
+
+    def _upsample_audio(self, audio_data, from_rate, to_rate):
+        """Upsample audio to higher sample rate"""
+        number_of_samples = round(len(audio_data) * to_rate / from_rate)
+        resampled = signal.resample(audio_data, number_of_samples)
+        return resampled.astype(np.int16)
+
     def _mulaw_to_linear(self, mulaw_data):
         """Convert mu-law audio to linear PCM"""
         # Standard mu-law decoding
@@ -237,4 +337,4 @@ class RTMTDirectHandler:
         if call_sid in self.audio_buffers:
             del self.audio_buffers[call_sid]
             
-        logger.info(f"Closed RTMT connection for call {call_sid}")       
+        logger.info(f"Closed RTMT connection for call {call_sid}")
